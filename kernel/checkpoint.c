@@ -2479,27 +2479,21 @@ int checkpoint_restore(const char *host_path) {
     ckpt_thaw_all();
     atomic_fetch_sub_explicit(&ckpt_restoring, 1, memory_order_acq_rel);
 
-    // Nudge each restored terminal into redrawing.
+    // NO redraw nudge here. It was tried and it crashed the app.
     //
-    // A checkpoint saves the machine, not the picture of it: the shell printed
-    // its prompt before the suspend and has no reason to print it again, so a
-    // resumed session came back as a blank window attached to a perfectly
-    // healthy shell. The first person to use this read that as the terminals
-    // having been lost, which is a bad thing for a restore to look like.
+    // A SIGWINCH to each restored terminal was meant to make a resumed shell
+    // reprint its prompt. But a re-launched zsh loads the zle module during
+    // its own startup, and zle's getbyte calls zrefresh whenever `resetneeded`
+    // is set -- which is exactly what a WINCH sets. The signal landed inside
+    // query_terminal, so zrefresh ran before zle had built a prompt, and
+    // countprompt(lpromptbuf) dereferenced NULL (deps/zsh Src/Zle/
+    // zle_refresh.c:770). Device crash 2026-09-12, a pty attach in the
+    // breadcrumbs in the same second.
     //
-    // SIGWINCH is the honest signal for it -- the terminal really is a new
-    // window -- and redrawing on one is what a line editor already does:
-    // zsh's zle and readline both reprint the prompt line. A shell with no
-    // line editor (dash) still will not, because it only prints a prompt after
-    // reading a line; pressing Return remains the answer there.
-    //
-    // After the thaw, because a frozen task cannot take a signal, and before
-    // ckpt_lock is taken, so this never holds two locks at once.
-    for (uint32_t i = 0; i < st.set_count; i++) {
-        if (st.sets[i].tty != NULL)
-            tty_signal_fg_group(st.sets[i].tty, SIGWINCH_);
-    }
-
+    // It is also no longer needed: the workspace now carries each terminal's
+    // screen and scrollback across the suspend, and that history already ENDS
+    // with the prompt the shell had printed. Restoring what was on the screen
+    // is a better answer than asking the shell to draw it again.
     lock(&ckpt_lock, 0);
     // Hand the restored sessions to the UI. Published only on success: a
     // restore that failed half way leaves tasks that are about to be torn

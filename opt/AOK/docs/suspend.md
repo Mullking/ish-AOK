@@ -99,12 +99,17 @@ refusal names the process and the reason, in `/proc/ish/checkpoint`:
 A refusal costs nothing: the session carries on exactly as it was. A save is a
 copy, and the machine is stopped only for as long as it takes to write one.
 
-**A resumed session starts with a blank screen.** Press Return and your prompt
-appears. Nothing has been lost: a checkpoint saves the machine, not the
-picture of it. The shell printed its prompt before the suspend, and it has no
-reason to print it again -- so the terminal is a fresh, empty window attached
-to a shell that is exactly where you left it. Anything you type goes to the
-session you saved.
+**A resumed Workspace session brings its screen back with it.** What each
+terminal had printed -- the screen and the scrollback -- is carried across with
+the arrangement and written back before the session starts, so a resumed window
+looks like the one you left rather than an empty box.
+
+Two limits worth knowing. The text comes back, the **colour does not**: the
+terminal cannot hand its attributes back, so old output is restored in plain
+text. And in full-screen shell mode (outside Workspace) the screen is not yet
+carried, so a resumed terminal there is blank until you press Return -- nothing
+has been lost, the shell simply has no reason to reprint a prompt it already
+printed.
 
 **Sockets are rebuilt, not copied.** A socket belongs to the process that owns
 it and cannot outlive it -- on iOS it does not even outlive a suspension, since

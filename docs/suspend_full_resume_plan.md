@@ -51,7 +51,10 @@ native-program bug read: the session was fine, nothing showed it.
 | terminal windows bound to restored sessions | **missing** |
 | mode (shell / Workspace / Wayland) recorded with the image | **missing** |
 | applet state: Files, Markdown, Image | implemented |
-| applet state: MotePad, Monitor, LLM chat, Music, Display, Launcher, Desktops | **missing** |
+| applet state: MotePad, Video, Launcher, Browser | implemented 2026-09-12 |
+| applet state: Music (Audio player) | **missing** -- state lives in the shared AudioPlayerEngine, not the applet |
+| applet state: LLM chat | **unchecked** -- transcripts are persisted separately; may need nothing |
+| applet state: Clock, Info, Monitor, Networks, Status, Storage, Sessions, Desktops, Themes, Shortcuts | **not needed** -- every one of these renders live or derived data |
 | Wayland applet reconnect after resume | **missing** |
 
 ## Wayland
@@ -76,7 +79,18 @@ RFB to it over a socket. So resuming it is two halves:
 2. Bind terminal windows to restored sessions by leader pid.
 3. Record the mode with the image, so a Workspace suspend comes back in
    Workspace.
-4. `WorkspaceStatefulTool` for the applets that lack it, cheapest first.
+4. `WorkspaceStatefulTool` for the applets that lack it. Mostly done; what is
+   left is the Audio player (its state is the shared engine's, not the
+   applet's) and confirming the LLM chat needs nothing.
+
+   The MotePad case turned out not to be about the protocol at all. Its drafts
+   were already autosaved against a jetsam kill -- debounced ~2s, written on an
+   IO queue -- but Suspend and Exit ends in `exit(0)`, which fires no background
+   notification and does not wait for a queued write. Text typed seconds before
+   a suspend had never reached disk. Its `workspaceToolStateForSaving` now
+   flushes synchronously, and records the draft SLOT NAME so the restored window
+   reclaims the draft it actually wrote rather than trusting that windows are
+   recreated in the same order.
 5. Wayland reconnect.
 
 ## Testing

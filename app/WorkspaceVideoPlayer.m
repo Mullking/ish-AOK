@@ -135,6 +135,26 @@ static void *kWorkspaceVideoPlayerItemStatusContext = &kWorkspaceVideoPlayerItem
     [self loadPath:guestPath];
 }
 
+#pragma mark WorkspaceStatefulTool
+
+// Which file was open, so a resumed workspace does not come back with an empty
+// player. Same shape as the image viewer: the PATH travels, not the media --
+// the file is in the guest filesystem, which the checkpoint restores anyway.
+//
+// Playback POSITION is deliberately not carried: it lives in an AVPlayerItem
+// that does not exist yet at restore time, and reopening at the start of the
+// file is a normal thing for a player to do, where jumping to a stale offset in
+// a file that may have changed is not.
+- (nullable NSDictionary<NSString *, id> *)workspaceToolStateForSaving {
+    return _currentPath.length > 0 ? @{@"path": _currentPath} : nil;
+}
+
+- (void)workspaceRestoreToolState:(NSDictionary<NSString *, id> *)state {
+    NSString *path = [state[@"path"] isKindOfClass:NSString.class] ? state[@"path"] : nil;
+    if (path.length > 0)
+        [self loadPath:path];  // a since-deleted file shows the load error, honestly
+}
+
 #pragma mark Loading
 
 - (void)reload {

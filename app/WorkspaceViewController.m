@@ -2594,10 +2594,10 @@ static BOOL ISHWorkspaceThemeIdentifierIsBuiltIn(NSString *identifier) {
 @interface WorkspaceShortcutsToolViewController : WorkspaceThemedToolViewController
 @end
 
-@interface WorkspaceLauncherToolViewController : WorkspaceThemedToolViewController <UITableViewDataSource, UITableViewDelegate, UITableViewDragDelegate, UITableViewDropDelegate, UIDropInteractionDelegate>
+@interface WorkspaceLauncherToolViewController : WorkspaceThemedToolViewController <UITableViewDataSource, UITableViewDelegate, UITableViewDragDelegate, UITableViewDropDelegate, UIDropInteractionDelegate, WorkspaceStatefulTool>
 @end
 
-@interface WorkspaceBrowserToolViewController : WorkspaceThemedToolViewController <UITextFieldDelegate, WKNavigationDelegate, WKUIDelegate>
+@interface WorkspaceBrowserToolViewController : WorkspaceThemedToolViewController <UITextFieldDelegate, WKNavigationDelegate, WKUIDelegate, WorkspaceStatefulTool>
 @end
 
 @interface WorkspaceThemesToolViewController : WorkspaceThemedToolViewController
@@ -8566,6 +8566,31 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
     return color != nil ? color : fallback;
 }
 
+#pragma mark WorkspaceStatefulTool
+
+// Which group the list was drilled into. Cheap to carry and jarring to lose:
+// a resumed Launcher that jumps back to the top level looks like it forgot
+// where you were, because it has.
+- (nullable NSDictionary<NSString *, id> *)workspaceToolStateForSaving {
+    return _currentPath.count > 0 ? @{@"path": [_currentPath copy]} : nil;
+}
+
+- (void)workspaceRestoreToolState:(NSDictionary<NSString *, id> *)state {
+    NSArray *path = [state[@"path"] isKindOfClass:NSArray.class] ? state[@"path"] : nil;
+    if (path == nil)
+        return;
+    [_currentPath removeAllObjects];
+    for (id index in path) {
+        if ([index isKindOfClass:NSNumber.class])
+            [_currentPath addObject:index];
+    }
+    // The shortcut list is editable and may have changed since the suspend, so
+    // the saved indices are not assumed to still point anywhere -- this is the
+    // same clamp the applet already uses when a group is deleted underneath it.
+    [self clampCurrentPathToValidLevel];
+    [self rebuildLauncherList];
+}
+
 - (void)rebuildLauncherList {
     for (UIView *view in [_contentStack.arrangedSubviews copy]) {
         [_contentStack removeArrangedSubview:view];
@@ -9502,7 +9527,7 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
 @end
 
 
-@interface WorkspaceMotePadToolViewController () <UITextViewDelegate, UIFontPickerViewControllerDelegate, WorkspaceFileOpenable, WorkspaceFocusable>
+@interface WorkspaceMotePadToolViewController () <UITextViewDelegate, UIFontPickerViewControllerDelegate, WorkspaceFileOpenable, WorkspaceFocusable, WorkspaceStatefulTool>
 @end
 
 @implementation WorkspaceMotePadToolViewController {
@@ -9964,6 +9989,66 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
         [MotePadClaimedDraftSlots() removeObject:name];
     else
         dispatch_async(dispatch_get_main_queue(), ^{ [MotePadClaimedDraftSlots() removeObject:name]; });
+}
+
+#pragma mark WorkspaceStatefulTool
+
+// What this editor needs in order to come back as itself.
+//
+// The draft machinery above already survives a jetsam kill: text is mirrored to
+// a numbered slot, debounced ~2s, and reclaimed on window creation "in creation
+// order, so the slots line back up". A checkpoint breaks both halves of that.
+//
+// The debounce loses outright. Suspend and Exit ends in exit(0) -- no
+// background notification, and autosaveDraftNow's write is queued on the IO
+// queue, so a process that exits immediately never performs it. Text typed
+// seconds before a suspend was simply gone, which is what was reported.
+// So this writes the draft HERE, synchronously, before returning.
+//
+// And creation order is not a safe key across a restore: it holds only if the
+// layout recreates every MotePad in the same order with nothing else opening
+// one in between. The slot NAME is recorded instead, so a window reclaims the
+// draft it actually wrote.
+- (nullable NSDictionary<NSString *, id> *)workspaceToolStateForSaving {
+    NSMutableDictionary<NSString *, id> *state = [NSMutableDictionary dictionary];
+    NSURL *url = [self draftFileURL];
+    if (url != nil) {
+        if (_dirty) {
+            // Synchronous on purpose -- see above. The snapshot is taken on the
+            // main thread either way; only the write moves.
+            [_draftTimer invalidate];
+            _draftTimer = nil;
+            [[self draftDataSnapshot] writeToURL:url options:NSDataWritingAtomic error:NULL];
+        }
+        state[@"draftSlot"] = _draftSlotName;
+    }
+    if (_currentGuestPath.length > 0)
+        state[@"path"] = _currentGuestPath;
+    state[@"dirty"] = @(_dirty);
+    return state;
+}
+
+- (void)workspaceRestoreToolState:(NSDictionary<NSString *, id> *)state {
+    if (![state isKindOfClass:NSDictionary.class])
+        return;
+    NSString *slot = state[@"draftSlot"];
+    if ([slot isKindOfClass:NSString.class] && slot.length > 0 &&
+            ![slot isEqualToString:_draftSlotName]) {
+        // viewDidLoad has already claimed a slot by number. Swap to the one
+        // this window actually wrote, if nothing else holds it -- and give the
+        // guessed one back so the next window can have it.
+        NSMutableSet<NSString *> *claimed = MotePadClaimedDraftSlots();
+        if (![claimed containsObject:slot]) {
+            [WorkspaceMotePadToolViewController releaseDraftSlotNamed:_draftSlotName];
+            [claimed addObject:slot];
+            _draftSlotName = slot;
+        }
+    }
+    // Re-run the normal restore against the slot we now hold. It refuses to
+    // stomp a window the user has already typed into, and it compares the
+    // draft's date against the file's, so a document saved since is not
+    // overwritten by a stale draft.
+    [self restoreDraftIfNewer];
 }
 
 - (void)claimDraftSlot {
@@ -12421,6 +12506,40 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     if (_selectedTabIndex < 0 || _selectedTabIndex >= (NSInteger) _tabWebViews.count)
         return nil;
     return _tabWebViews[_selectedTabIndex];
+}
+
+#pragma mark WorkspaceStatefulTool
+
+// The pages that were open.
+//
+// Every tab's address is recorded, but only the SELECTED one is reopened: the
+// applet builds its tabs through its own creation path and re-driving that from
+// a restore is a separate piece of work. Saving them all now means the rest can
+// be brought back later without a second format change, and costs a few strings
+// in the meantime.
+- (nullable NSDictionary<NSString *, id> *)workspaceToolStateForSaving {
+    NSMutableArray<NSString *> *addresses = [NSMutableArray array];
+    for (WKWebView *tab in _tabWebViews) {
+        NSString *address = tab.URL.absoluteString;
+        [addresses addObject:address.length > 0 ? address : @""];
+    }
+    if (addresses.count == 0)
+        return nil;
+    return @{@"tabs": addresses, @"selected": @(_selectedTabIndex)};
+}
+
+- (void)workspaceRestoreToolState:(NSDictionary<NSString *, id> *)state {
+    NSArray *tabs = [state[@"tabs"] isKindOfClass:NSArray.class] ? state[@"tabs"] : nil;
+    if (tabs.count == 0)
+        return;
+    NSInteger selected = [state[@"selected"] isKindOfClass:NSNumber.class]
+            ? [state[@"selected"] integerValue] : 0;
+    if (selected < 0 || selected >= (NSInteger) tabs.count)
+        selected = 0;
+    NSString *address = tabs[(NSUInteger) selected];
+    if (![address isKindOfClass:NSString.class] || address.length == 0)
+        return;
+    [self loadAddressString:address inWebView:[self currentBrowserWebView]];
 }
 
 - (void)loadAddressString:(NSString *)addressString inWebView:(WKWebView *)webView {

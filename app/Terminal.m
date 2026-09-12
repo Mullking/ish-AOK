@@ -515,6 +515,49 @@ struct tty *ISHOpenTerminalForRestoredSession(void) {
     }];
 }
 
+- (void)fetchContentsWithCompletion:(void (^)(NSString *))completion {
+    if (completion == nil)
+        return;
+    if (!self.loaded) {
+        completion(nil);
+        return;
+    }
+    [self.webView evaluateJavaScript:@"exports.getContents(2000)"
+                   completionHandler:^(id result, NSError *error) {
+        // Never fail the save for this: the history is a nicety and the guest
+        // is the point. A nil here just means the window comes back empty, the
+        // way every window did before this existed.
+        completion([result isKindOfClass:NSString.class] && error == nil ? result : nil);
+    }];
+}
+
+- (void)writeRestoredContents:(NSString *)contents {
+    if (contents.length == 0)
+        return;
+    // Through the same path guest output takes, so hterm decodes it the same
+    // way -- and BEFORE the restored session writes anything, so the shell's
+    // first prompt lands after the history rather than in the middle of it.
+    NSData *data = [contents dataUsingEncoding:NSUTF8StringEncoding];
+    if (data.length == 0)
+        return;
+    [self sendOutput:data.bytes length:(int) data.length];
+}
+
+- (int)guestSessionId {
+    // Same care as setSize's lookup above: the value read from the terminal is
+    // an identity token only, and tty_lookup_ref re-finds the tty under the
+    // lock that free must hold, so a recycled pty number cannot aim this at
+    // another terminal's tty.
+    struct tty *tty = tty_lookup_ref(self.type, self.number, NULL);
+    if (tty == NULL)
+        return 0;
+    lock(&tty->lock, 0);
+    int session = (int) tty->session;
+    unlock(&tty->lock);
+    tty_put(tty);
+    return session;
+}
+
 - (void)setEnableVoiceOverAnnounce:(BOOL)enableVoiceOverAnnounce {
     _enableVoiceOverAnnounce = enableVoiceOverAnnounce;
     if (!self.loaded)

@@ -4180,11 +4180,15 @@ void ISHSuspendGuardEnterBackground(void) {
                     saveTask = UIBackgroundTaskInvalid;
                 }
             }];
-            // Captured on the way OUT of the main thread, before the work is
-            // handed to the background queue: the arrangement is UIKit state
-            // and this is the last moment it is certainly quiescent.
-            ISHWorkspaceCaptureLayoutForSuspend();
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                // Captured from the BACKGROUND queue, not before it.
+                //
+                // It reads UIKit and so hops to main internally -- but it also
+                // collects what each terminal has printed, and that answer
+                // comes back from a web view ON MAIN. Called from the main
+                // thread it could not wait for its own completions, so the
+                // history would be silently skipped; from here it can.
+                ISHWorkspaceCaptureLayoutForSuspend();
                 int cerr = checkpoint_save_external(image.fileSystemRepresentation);
                 struct checkpoint_status ck;
                 checkpoint_get_status(&ck);

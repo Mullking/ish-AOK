@@ -136,6 +136,11 @@ static NSString *const ISHWorkspaceToolDisplayIdentifier = @"display";
 // and this goes nil by itself, which is exactly the answer the guest should
 // get -- "there is no Workspace" rather than a dangling one.
 static __weak WorkspaceViewController *ISHWorkspaceActiveController = nil;
+// What each terminal had printed, keyed by terminal UUID, captured just before
+// a checkpoint. Populated by -captureTerminalContentsThen: and read by
+// -savedLayoutDescriptorForWindow:, which is synchronous and cannot wait for a
+// web view itself.
+static NSDictionary<NSString *, NSString *> *ISHWorkspaceCapturedTerminalContents = nil;
 
 
 // Every tool a guest may name. The guest gets this list by reading
@@ -3391,9 +3396,26 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         // the process and the restore hands out fresh pts numbers, but the
         // checkpoint restores pids, so this is what lets the window ask for
         // its OWN shell back rather than whichever one is next in the queue.
-        int sessionPid = windowView.hostedTerminalViewController.sessionPid;
+        // Prefer the TTY's own session id over the pid the window remembers.
+        //
+        // A window does not always start the session it shows: one that adopted
+        // an existing terminal never learned a pid, so this recorded nothing
+        // and the restore fell back to queue order -- two terminals coming back
+        // holding each other's shells. The tty knows its session whoever opened
+        // it, and a session leader's pid IS the session id, which is what the
+        // restore reports.
+        int sessionPid = windowView.hostedTerminalViewController.terminal.guestSessionId;
+        if (sessionPid <= 0)
+            sessionPid = windowView.hostedTerminalViewController.sessionPid;
         if (sessionPid > 0)
             descriptor[@"sessionPid"] = @(sessionPid);
+        // What this terminal had printed. Not part of the guest at all -- it
+        // lives in hterm -- so without this a resumed window came back blank
+        // and the session's whole history was gone.
+        NSString *captured = ISHWorkspaceCapturedTerminalContents[
+            (displayTerminalUUID ?: sessionTerminalUUID).UUIDString];
+        if (captured.length > 0)
+            descriptor[@"contents"] = captured;
         CGFloat overrideFontSize = windowView.hostedTerminalViewController.overrideFontSize;
         if (overrideFontSize > 0)
             descriptor[@"fontSize"] = @(overrideFontSize);
@@ -3745,6 +3767,35 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     return windowView;
 }
 
+// Ask every terminal what it has printed, then run `completion` on main.
+//
+// Separate from saveWorkspaceLayout because the answer crosses into a web view
+// and comes back asynchronously, while building a descriptor is synchronous.
+- (void)captureTerminalContentsThen:(dispatch_block_t)completion {
+    NSMutableDictionary<NSString *, NSString *> *captured = [NSMutableDictionary dictionary];
+    dispatch_group_t group = dispatch_group_create();
+    for (UIView *subview in self.desktopSurfaceView.subviews) {
+        if (![subview isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) subview;
+        Terminal *terminal = windowView.hostedTerminalViewController.terminal;
+        NSString *key = terminal.uuid.UUIDString;
+        if (terminal == nil || key.length == 0)
+            continue;
+        dispatch_group_enter(group);
+        [terminal fetchContentsWithCompletion:^(NSString *contents) {
+            if (contents.length > 0)
+                captured[key] = contents;
+            dispatch_group_leave(group);
+        }];
+    }
+    dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+        ISHWorkspaceCapturedTerminalContents = captured;
+        if (completion != nil)
+            completion();
+    });
+}
+
 - (void)saveWorkspaceLayout:(id)sender {
     NSMutableArray<NSDictionary<NSString *, id> *> *layout = [NSMutableArray array];
     for (UIView *subview in self.desktopSurfaceView.subviews) {
@@ -3859,6 +3910,14 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
                                        toWindow:windowView
                                    fallbackSize:ISHWorkspacePreferredTerminalContentSize()];
                 [self assignRestoredWindow:windowView toDesktopFromDescriptor:descriptor];
+                // The history first, before the restored session writes a
+                // thing, so the shell's prompt lands after it rather than in
+                // the middle of it. sendOutput buffers until the web view has
+                // loaded, so this is safe this early.
+                NSString *savedContents = descriptor[@"contents"];
+                if ([savedContents isKindOfClass:NSString.class] && savedContents.length > 0)
+                    [windowView.hostedTerminalViewController.terminal
+                        writeRestoredContents:savedContents];
                 CGFloat savedFontSize = [descriptor[@"fontSize"] doubleValue];
                 if (savedFontSize > 0)
                     windowView.hostedTerminalViewController.overrideFontSize = savedFontSize;
@@ -14018,10 +14077,21 @@ void ISHWorkspaceCaptureLayoutForSuspend(void) {
     // than the image does. Nothing is holding the main thread at this point;
     // the freeze has not started yet.
     if (NSThread.isMainThread) {
+        // Cannot collect the terminals' history from here: evaluateJavaScript
+        // answers ON THIS THREAD, so waiting for it would deadlock. Geometry
+        // only -- every caller that can afford to wait comes in off-main.
         [workspace saveWorkspaceLayout:nil];
-    } else {
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            [workspace saveWorkspaceLayout:nil];
-        });
+        return;
     }
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [workspace captureTerminalContentsThen:^{
+            [workspace saveWorkspaceLayout:nil];
+            dispatch_semaphore_signal(done);
+        }];
+    });
+    // Bounded: a web view that never answers must not hold up the checkpoint.
+    // The layout is then simply the one from before, which is worse than fresh
+    // and far better than no save.
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t) (5 * NSEC_PER_SEC)));
 }

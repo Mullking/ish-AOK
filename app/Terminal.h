@@ -28,6 +28,23 @@ struct tty *ISHOpenTerminalForRestoredSession(void);
 @property (readonly) NSUUID *uuid;
 @property (readonly) int type;
 @property (readonly) int number;
+// The guest SESSION this terminal is carrying, or 0 when it has none.
+//
+// This is what a checkpoint keys a restored session on -- the restore reports
+// a session's leader pid, and a session leader's pid IS its session id. Read
+// from the tty rather than remembered by the window, because a window does not
+// always start the session it shows: one that ADOPTS an existing terminal
+// (reconnectSessionFromTerminalUUID:) never learned a pid at all, so the saved
+// layout recorded nothing and every window fell back to queue order -- which
+// is two terminals coming back with each other's shells.
+@property (readonly) int guestSessionId;
+// What this terminal has printed -- screen plus scrollback -- as plain text.
+//
+// Asynchronous because it crosses into the web view. The completion runs on the
+// MAIN queue, so a caller that waits for it must not itself be on main.
+- (void)fetchContentsWithCompletion:(void (^)(NSString *contents))completion;
+// Put previously captured text back, before a session starts writing to it.
+- (void)writeRestoredContents:(NSString *)contents;
 
 + (void)convertCommand:(NSArray<NSString *> *)command toArgs:(char *)argv limitSize:(size_t)maxSize;
 

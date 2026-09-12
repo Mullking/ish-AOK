@@ -183,6 +183,35 @@ exports.getCharacterSize = () => {
 };
 
 exports.clearScrollback = () => term.clearScrollback();
+
+// Everything on screen and in the scrollback, as plain text.
+//
+// A checkpoint saves the GUEST; what a terminal has already printed lives here,
+// in hterm, and is not part of the guest at all -- so a resumed session used to
+// come back on an empty window with its whole history gone. This is how that
+// history is carried across.
+//
+// Plain text, deliberately: hterm has no way to hand back the attributes, so
+// colour and bold do not survive. Losing the colour of old output is a much
+// smaller loss than losing the output.
+exports.getContents = (maxRows) => {
+    const total = term.getRowCount();
+    const limit = maxRows > 0 ? maxRows : 2000;
+    const start = Math.max(0, total - limit);
+    const out = [];
+    for (let i = start; i < total; i++) {
+        out.push(term.getRowText(i));
+    }
+    // Trailing blanks are the empty screen below the cursor. Kept, a restored
+    // window opens with a page of blank lines and the history scrolled out of
+    // sight.
+    while (out.length > 0 && out[out.length - 1] === '') {
+        out.pop();
+    }
+    // CRLF, not LF: hterm treats a bare newline as a line feed with no carriage
+    // return, which staircases the restored text down and off the right edge.
+    return out.join('\r\n');
+};
 exports.setUserGesture = () => term.accessibilityReader_.hasUserGesture = true;
 // Padding between the terminal text and the webview edge. Native lowers this to 0
 // when "Maximize Screen Space" is on with an external keyboard to reclaim edge space.

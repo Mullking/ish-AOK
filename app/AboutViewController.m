@@ -259,18 +259,29 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
-    // Deliberately NOT cleared here any more.
+    // Cleared once it has done its job, and that is deliberate.
     //
-    // This is a SWITCH in the iOS Settings app, and a switch that turns itself
-    // off the first time it works is a switch that does not work: set it, get
-    // Diagnostics once, relaunch expecting Diagnostics, get the shell. Reported
-    // exactly that way. A switch stays where it was put until it is moved.
+    // This is a one-shot: "open Diagnostics on the NEXT launch", not "always
+    // open Diagnostics". Without the disarm it is a trap, because the launch
+    // override wins over every other root controller -- so if it cannot be
+    // cleared from inside the app, the app opens into Diagnostics forever and
+    // the only way out is the Settings app successfully writing the key.
+    // That happened: it was switched off in Settings and the preference on disk
+    // stayed true, so every launch still landed here.
     //
-    // The disarm it used to do was protection against getting stuck in
-    // Diagnostics -- but the control lives OUTSIDE the app, in Settings, so it
-    // can always be turned off no matter what state iSH-AOK itself is in.
-    // That is the whole reason this preference is in Settings rather than in
-    // the app's own UI.
+    // I removed this once, reasoning that a Settings SWITCH should stay where
+    // it is put. The reasoning was fine; the premise was wrong. The report that
+    // prompted it -- "I set it and got the shell" -- was the app CRASHING in
+    // willFinishLaunching, which runs before the scene connects, so Diagnostics
+    // never got its turn and the disarm was never involved. The Settings title
+    // now says "Next Launch", so the one-shot is stated rather than surprising.
+    if ([NSUserDefaults.standardUserDefaults boolForKey:kPreferenceOpenDiagnosticsOnLaunchKey]) {
+        [NSUserDefaults.standardUserDefaults setBool:NO forKey:kPreferenceOpenDiagnosticsOnLaunchKey];
+        // Straight to disk. The Settings app and iSH-AOK are different
+        // processes sharing this domain, and the stuck state above is what a
+        // lost write looks like from the outside.
+        [NSUserDefaults.standardUserDefaults synchronize];
+    }
 }
 
 // The Refresh button. The ONLY thing that replaces the text after the first

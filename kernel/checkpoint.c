@@ -592,9 +592,37 @@ static int ckpt_freeze_all(unsigned timeout_ms, char *blame, size_t blame_size) 
 static void ckpt_thaw_all(void) {
     struct task_snapshot snap = {0};
     if (task_snapshot_collect(&snap, false) == 0) {
-        for (unsigned i = 0; i < snap.count; i++)
+        for (unsigned i = 0; i < snap.count; i++) {
             atomic_store_explicit(&snap.tasks[i]->ckpt_freeze_wanted, false,
                                   memory_order_release);
+            // And drop what each native program said about itself.
+            //
+            // checkpoint_native_park fills this in per task, on that task's own
+            // thread, and it is guarded by `== NULL` so a program describes
+            // itself ONCE. Nothing cleared it: the guest-initiated path frees
+            // only `current`'s copy, and the app's external save frees none at
+            // all. So every native that parked kept its first description
+            // forever, and the SECOND save of a session wrote the state from
+            // the FIRST one -- a restored shell then came back holding a
+            // snapshot of itself from a suspend ago.
+            //
+            // Reported as: resume a session, open more windows, suspend again,
+            // and the next resume has nothing. A shell restored from a stale,
+            // mismatched state exits on startup, and a workspace window whose
+            // session ends closes itself, so the windows vanish rather than
+            // arriving wrong.
+            //
+            // The guest path already had the rule right in its own comment --
+            // "it describes a moment that has passed, and leaving it would have
+            // the next checkpoint write a stale state" -- it simply could not
+            // reach the other tasks. Here it can: this is where every parked
+            // task is released, on every path, success or refusal.
+            //
+            // Before the broadcast below, so the owning threads are still
+            // parked and none of them can be reading it.
+            free(snap.tasks[i]->ckpt_native_state);
+            snap.tasks[i]->ckpt_native_state = NULL;
+        }
         task_snapshot_release(&snap);
     }
     pthread_mutex_lock(&ckpt_park_lock);

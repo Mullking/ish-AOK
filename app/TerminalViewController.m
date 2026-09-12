@@ -376,7 +376,14 @@ static const NSInteger kMaximumTerminalFontSize = 72;
 // because a retry loop that never gives up would fight a user who has
 // deliberately dismissed the keyboard.
 - (void)focusTerminalAttempt:(NSInteger)attempt {
-    if (!UserPreferences.shared.autoShowKeyboard)
+    // autoShowKeyboard is about the SOFTWARE keyboard. First-responder status
+    // is what routes hardware keys too, so gating this on that preference left
+    // a terminal with a hardware keyboard attached unable to receive anything
+    // unless a stray tap happened to focus it -- which is what "focus is often
+    // unreliable" was. iOS does not raise the software keyboard for a first
+    // responder while a hardware keyboard is connected, so taking focus here
+    // costs the preference nothing.
+    if (!UserPreferences.shared.autoShowKeyboard && !self.hasExternalKeyboard)
         return;
     UIView *view = self.termView;
     if (view == nil || view.isFirstResponder)
@@ -487,8 +494,9 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     // What the boot block in viewDidLoad is followed by: the terminal cannot be
     // attached to the view until there IS a guest.
     [self _applyCurrentTerminalToViewIfPossible];
-    if (UserPreferences.shared.autoShowKeyboard)
-        [self.termView becomeFirstResponder];
+    // Via focusTerminal, so this gets the hardware-keyboard case and the
+    // verify-and-retry with it.
+    [self focusTerminal];
 }
 
 - (void)viewDidLoad {
@@ -530,8 +538,7 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     // _bootAfterSessionChoice does them once the answer is in.
     if (!self.awaitingSessionChoice) {
         [self _applyCurrentTerminalToViewIfPossible];
-        if (UserPreferences.shared.autoShowKeyboard)
-            [self.termView becomeFirstResponder];
+        [self focusTerminal];
     }
 
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];

@@ -222,6 +222,10 @@ static NSArray<NSString *> *ISHSessionCommandWithFallback(NSArray<NSString *> *c
 @property (strong, nonatomic) UIButton *saveSessionButton;
 @property (weak, nonatomic) UIAlertController *saveProgressHUD;
 @property (nonatomic) BOOL awaitingSessionChoice;
+// Set when the resume was asked to CONSUME the image it came from. Acted on
+// only after the restore has actually produced a session -- see
+// -_bootAfterSessionChoice.
+@property (nonatomic, copy) NSString *pendingResumeImageToDelete;
 @property (nonatomic) BOOL saveSessionInProgress;
 @property (strong, nonatomic) UIButton *terminalSwitcherButton;
 @property (strong, nonatomic) BarButton *dotKey;
@@ -417,6 +421,55 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     });
 }
 
+// Keep the saved copy, or consume it?
+//
+// A resumed image is not automatically finished with: iSH-AOK goes on writing
+// to the slot it came from, so the copy on disk stays resumable. That is the
+// safe default and it is what people want after a crash -- but it also means
+// the same session can be resumed twice, which gives two live copies of one
+// machine, and an image nobody intends to use again just sits there.
+//
+// So the choice is offered rather than assumed, and "delete" means AFTER the
+// restore has worked: consuming it first would destroy the only copy if the
+// restore then failed.
+- (void)_presentResumeDispositionForSlot:(NSDictionary *)slot {
+    NSString *path = slot[@"path"];
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"Resume this session"
+                         message:@"Keep the saved copy so it can be resumed again, "
+                                 @"or remove it once this session is running?"
+                  preferredStyle:UIAlertControllerStyleAlert];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Resume and Save"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *a) {
+        ISHSessionSetResumeChoice(path);
+        self.pendingResumeImageToDelete = nil;
+        [self _bootAfterSessionChoice];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Resume and Delete"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(__unused UIAlertAction *a) {
+        ISHSessionSetResumeChoice(path);
+        // Remembered, not done: the file is removed once there is a running
+        // session to show for it.
+        self.pendingResumeImageToDelete = path;
+        [self _bootAfterSessionChoice];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Back"
+                                              style:UIAlertActionStyleCancel
+                                            handler:^(__unused UIAlertAction *a) {
+        // Nothing has been decided yet, so the picker can simply come back.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self _presentSessionResumePicker];
+        });
+    }]];
+
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
 // Resume which session, or none.
 //
 // Presented BEFORE the guest boots, because the answer decides whether it
@@ -454,10 +507,17 @@ static const NSInteger kMaximumTerminalFontSize = 72;
             [UIAlertAction actionWithTitle:title
                                      style:UIAlertActionStyleDefault
                                    handler:^(__unused UIAlertAction *a) {
-            ISHSessionSetResumeChoice(loadable ? slot[@"path"] : nil);
-            if (!loadable)
+            if (!loadable) {
+                ISHSessionSetResumeChoice(nil);
                 [NSFileManager.defaultManager removeItemAtPath:slot[@"path"] error:nil];
-            [self _bootAfterSessionChoice];
+                [self _bootAfterSessionChoice];
+                return;
+            }
+            // Next runloop turn: this sheet is still dismissing, and presenting
+            // the second one from inside its own handler races that.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self _presentResumeDispositionForSlot:slot];
+            });
         }];
         action.enabled = YES;
         [sheet addAction:action];
@@ -491,6 +551,24 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     // to wait (startNewSession). This is where it gets one: the restored
     // session if a slot was chosen, a fresh shell if not.
     [self startNewSession];
+
+    // The saved copy, if the resume was asked to consume it.
+    //
+    // Here and not in the picker: by this point the guest has been rebuilt and
+    // a session adopted, so there is something to show for the image. Deleting
+    // at the moment of choosing would have thrown away the only copy whenever
+    // the restore then failed -- which is the one case where you most want it
+    // back.
+    NSString *consume = self.pendingResumeImageToDelete;
+    if (consume.length > 0) {
+        self.pendingResumeImageToDelete = nil;
+        NSError *removeError = nil;
+        BOOL removed = [NSFileManager.defaultManager removeItemAtPath:consume error:&removeError];
+        [ISHDiagnosticsStore recordBreadcrumb:@"session.resumed.imageConsumed"
+                                      details:@{@"removed": @(removed),
+                                                @"error": removeError.localizedDescription ?: @""}];
+    }
+
     // What the boot block in viewDidLoad is followed by: the terminal cannot be
     // attached to the view until there IS a guest.
     [self _applyCurrentTerminalToViewIfPossible];

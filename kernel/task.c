@@ -7,6 +7,7 @@
 #include "kernel/native.h"
 #include "kernel/task.h"
 #include "kernel/checkpoint.h"
+#include "kernel/hostinfo.h"
 #include "emu/memory.h"
 #include "emu/tlb.h"
 #include "jit/jit.h"
@@ -853,8 +854,30 @@ void run_at_boot(void) {  // Stuff we run only once, at boot time.
     lock_init(&atomic_l_lock, "run_at_boot");
     // No guest arch named here: this runs once at boot, and one session
     // can run i386, x86_64, and arm64 guests (per-task ABI).
-    printk("iSH-AOK %s built %s %s booted on %d emulated CPU(s)\n",
-            uts.release, __DATE__, __TIME__, ncpu);
+    //
+    // The executable's timestamp, NOT __DATE__/__TIME__.
+    //
+    // This line is what everyone reads to answer "is the thing I am testing
+    // the thing I just built?", and __DATE__/__TIME__ cannot answer it: they
+    // are THIS FILE's compile time, and an incremental build that changes only
+    // app/ code relinks without recompiling task.c. Measured on two bundles
+    // here: one linked at 18:36 reported 18:21, another linked at 18:04
+    // reported 12:06. I read one of those lags as "you tested a stale build"
+    // and was wrong about it. buildTimestamp() is the same source of truth
+    // hostinfo.m already uses, and it has an implementation in both the app
+    // (kernel/hostinfo.m) and the CLI (platform/standalone.c).
+    char built[64];
+    time_t built_at = buildTimestamp();
+    if (built_at != 0) {
+        struct tm built_tm;
+        localtime_r(&built_at, &built_tm);
+        strftime(built, sizeof(built), "%b %d %Y %H:%M:%S", &built_tm);
+    } else {
+        // Nothing to stat -- better a compile time than no answer at all.
+        snprintf(built, sizeof(built), "%s %s", __DATE__, __TIME__);
+    }
+    printk("iSH-AOK %s built %s booted on %d emulated CPU(s)\n",
+            uts.release, built, ncpu);
     // Get boot time
     extern time_t boot_time;
          

@@ -357,9 +357,57 @@ static const NSInteger kMaximumTerminalFontSize = 72;
 }
 
 - (void)focusTerminal {
+    [self focusTerminalAttempt:0];
+}
+
+// Focus, verified -- because -becomeFirstResponder FAILS SILENTLY.
+//
+// It returns NO, with no error and no log, when the view is not in a window
+// yet, when the window is not key, or when the keyboard's own hosted scene is
+// not connected. Every one of those happens transiently while a workspace
+// window is being brought to the front, which is exactly when this is called
+// (didBecomeFrontmostHandler). Nothing checked the result, so a focus that lost
+// that race was lost for good and the window simply would not take input --
+// reported as focus being "often unreliable", with
+// "UIHostedScene-com.apple.InputUI ... No scene exists for this identity" in
+// the log at the moment it failed.
+//
+// So: try, check, and try again on the next runloop turns. Bounded at ~400ms,
+// because a retry loop that never gives up would fight a user who has
+// deliberately dismissed the keyboard.
+- (void)focusTerminalAttempt:(NSInteger)attempt {
     if (!UserPreferences.shared.autoShowKeyboard)
         return;
-    [self.termView becomeFirstResponder];
+    UIView *view = self.termView;
+    if (view == nil || view.isFirstResponder)
+        return;   // nothing to focus, or it already took
+
+    UIWindow *window = view.window;
+    if (window != nil) {
+        // A non-key window makes becomeFirstResponder a no-op. In workspace
+        // mode the contained windows are views inside one UIWindow, so this is
+        // normally already true; with scene windows it may not be.
+        if (!window.isKeyWindow)
+            [window makeKeyWindow];
+        if ([view becomeFirstResponder])
+            return;
+    }
+
+    static const NSInteger kMaxAttempts = 8;
+    if (attempt >= kMaxAttempts) {
+        // Say so rather than fail mutely, which is the whole complaint.
+        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.focus.gaveUp"
+                                      details:@{@"attempts": @(attempt),
+                                                @"inWindow": @(view.window != nil),
+                                                @"keyWindow": @(view.window.isKeyWindow),
+                                                @"embedded": @(self.embeddedInWorkspaceWindow)}];
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) (50 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf focusTerminalAttempt:attempt + 1];
+    });
 }
 
 // Resume which session, or none.
@@ -1120,8 +1168,10 @@ static const CGFloat kFindBarHeight = 44;
                 [self _scheduleSaveProgressHUD];
                 self.saveSessionInProgress = YES;
                 dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                    // Returns only on FAILURE: on success the process is gone.
-                    int err = ISHSuspendSessionSuspendAndExit();
+                    // Returns only on FAILURE: on success the process is gone,
+                    // so there is no value to inspect -- the reason is read
+                    // from checkpoint_get_status below.
+                    (void) ISHSuspendSessionSuspendAndExit();
                     struct checkpoint_status ck;
                     checkpoint_get_status(&ck);
                     dispatch_async(dispatch_get_main_queue(), ^{

@@ -257,6 +257,9 @@ static NSArray<NSString *> *ISHSessionCommandWithFallback(NSArray<NSString *> *c
 
 @property int sessionPid;
 @property (nonatomic) Terminal *sessionTerminal;
+// This window's session came back from an image rather than being started.
+// Decides which terminal the window then shows -- see -startNewSession.
+@property (nonatomic) BOOL sessionWasRestored;
 @property (nonatomic) BOOL sessionStartInProgress;
 @property (nonatomic) NSTimeInterval sessionStartedAt;
 @property (nonatomic) NSInteger consecutiveQuickSessionExits;
@@ -311,6 +314,21 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     if ([initialWindow isEqualToString:@"session-shell"])
         return NO;
     return YES;
+}
+
+// What this window should show now that it HAS a session.
+//
+// A resumed session shows the session it resumed. The fresh-session preference
+// below is about a window that has just started a shell: in Workspace mode it
+// answers "the system console", which is right for a new window and flatly
+// wrong for one that has just adopted a suspended shell -- it detached the
+// restored pty and put the console in its place, and because every window
+// answered the same way the second one got "already installed elsewhere" and
+// showed nothing at all. That is the blank Workspace restore.
+- (Terminal *)preferredTerminalForCurrentSession {
+    if (self.sessionWasRestored && self.sessionTerminal != nil)
+        return self.sessionTerminal;
+    return [self preferredTerminalForFreshSession];
 }
 
 - (Terminal *)preferredTerminalForFreshSession {
@@ -421,136 +439,20 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     });
 }
 
-// Keep the saved copy, or consume it?
+// The resume question, asked the same way from every root.
 //
-// A resumed image is not automatically finished with: iSH-AOK goes on writing
-// to the slot it came from, so the copy on disk stays resumable. That is the
-// safe default and it is what people want after a crash -- but it also means
-// the same session can be resumed twice, which gives two live copies of one
-// machine, and an image nobody intends to use again just sits there.
-//
-// So the choice is offered rather than assumed, and "delete" means AFTER the
-// restore has worked: consuming it first would destroy the only copy if the
-// restore then failed.
-- (void)_presentResumeDispositionForSlot:(NSDictionary *)slot {
-    NSString *path = slot[@"path"];
-    UIAlertController *sheet = [UIAlertController
-        alertControllerWithTitle:@"Resume this session"
-                         message:@"Keep the saved copy so it can be resumed again, "
-                                 @"or remove it once this session is running?"
-                  preferredStyle:UIAlertControllerStyleAlert];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Resume and Save"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *a) {
-        ISHSessionSetResumeChoice(path);
-        self.pendingResumeImageToDelete = nil;
-        // Un-pin the slot, or "Save" lasts about a minute.
-        //
-        // ISHSessionSetResumeChoice pins the current slot to the image that was
-        // resumed, on the reasoning that a resumed session keeps writing where
-        // it came from. That is right for a session being suspended over and
-        // over, and exactly wrong here: the next Suspend and Exit would write
-        // straight over the copy the user just asked to keep. Reported as
-        // "I said save and the previous suspend was gone".
-        //
-        // Unpinned, the next save takes a fresh slot and the kept copy stays
-        // resumable. Slots are finite (ISHSessionSlotLimit), so repeating this
-        // eventually recycles the oldest -- which is the honest meaning of
-        // "keep" on a device with a disk.
-        ISHSessionSetCurrentSlot(nil);
-        [self _bootAfterSessionChoice];
-    }]];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Resume and Delete"
-                                              style:UIAlertActionStyleDestructive
-                                            handler:^(__unused UIAlertAction *a) {
-        ISHSessionSetResumeChoice(path);
-        // The slot STAYS pinned here: the image is about to be deleted, so
-        // letting this session write back over that name reuses the freed slot
-        // instead of consuming another one.
-        // Remembered, not done: the file is removed once there is a running
-        // session to show for it.
-        self.pendingResumeImageToDelete = path;
-        [self _bootAfterSessionChoice];
-    }]];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Back"
-                                              style:UIAlertActionStyleCancel
-                                            handler:^(__unused UIAlertAction *a) {
-        // Nothing has been decided yet, so the picker can simply come back.
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self _presentSessionResumePicker];
-        });
-    }]];
-
-    [self presentViewController:sheet animated:YES completion:nil];
-}
-
-// Resume which session, or none.
-//
-// Presented BEFORE the guest boots, because the answer decides whether it
-// boots at all or is rebuilt from an image -- there is no undoing that once
-// ensureBooted has run.
+// The sheets themselves live in AppDelegate.m beside the slot bookkeeping:
+// Workspace-at-start and the standalone Wayland display need to ask it too, and
+// they have no terminal to ask through.
 - (void)_presentSessionResumePicker {
-    NSArray<NSDictionary *> *slots = ISHSessionSlots();
-    UIAlertController *sheet = [UIAlertController
-        alertControllerWithTitle:@"Resume a session?"
-                         message:slots.count == 1
-                                 ? @"iSH-AOK saved this session. Pick it up, or start fresh."
-                                 : @"iSH-AOK has saved sessions. Pick one up, or start fresh."
-                  preferredStyle:UIAlertControllerStyleAlert];
-
-    NSDateFormatter *when = [[NSDateFormatter alloc] init];
-    when.dateStyle = NSDateFormatterShortStyle;
-    when.timeStyle = NSDateFormatterShortStyle;
-
-    for (NSDictionary *slot in slots) {
-        // An image this build cannot load is offered as nothing but a deletion:
-        // choosing it would boot instead, which looks like the resume silently
-        // failing.
-        BOOL loadable = [slot[@"loadable"] boolValue];
-        NSString *title;
-        if (loadable) {
-            title = [NSString stringWithFormat:@"%@ — %@ process%@, %@",
-                     slot[@"hostname"], slot[@"tasks"],
-                     [slot[@"tasks"] unsignedLongValue] == 1 ? @"" : @"es",
-                     [when stringFromDate:slot[@"date"]]];
-        } else {
-            title = [NSString stringWithFormat:@"%@ (saved by a different build)",
-                     [when stringFromDate:slot[@"date"]]];
-        }
-        UIAlertAction *action =
-            [UIAlertAction actionWithTitle:title
-                                     style:UIAlertActionStyleDefault
-                                   handler:^(__unused UIAlertAction *a) {
-            if (!loadable) {
-                ISHSessionSetResumeChoice(nil);
-                [NSFileManager.defaultManager removeItemAtPath:slot[@"path"] error:nil];
-                [self _bootAfterSessionChoice];
-                return;
-            }
-            // Next runloop turn: this sheet is still dismissing, and presenting
-            // the second one from inside its own handler races that.
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self _presentResumeDispositionForSlot:slot];
-            });
-        }];
-        action.enabled = YES;
-        [sheet addAction:action];
-    }
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Start a New Session"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *a) {
-        // The images are KEPT. "New session" is about this launch, not about
-        // throwing away what is on disk -- deleting somebody's saved work
-        // because they wanted a fresh prompt is not a thing to do quietly.
-        ISHSessionSetResumeChoice(nil);
-        [self _bootAfterSessionChoice];
-    }]];
-
-    [self presentViewController:sheet animated:YES completion:nil];
+    __weak typeof(self) weakSelf = self;
+    ISHSessionPresentResumePicker(self, ^(NSString *imageToConsume) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf == nil)
+            return;
+        strongSelf.pendingResumeImageToDelete = imageToConsume;
+        [strongSelf _bootAfterSessionChoice];
+    });
 }
 
 - (void)_bootAfterSessionChoice {
@@ -577,14 +479,8 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     // the restore then failed -- which is the one case where you most want it
     // back.
     NSString *consume = self.pendingResumeImageToDelete;
-    if (consume.length > 0) {
-        self.pendingResumeImageToDelete = nil;
-        NSError *removeError = nil;
-        BOOL removed = [NSFileManager.defaultManager removeItemAtPath:consume error:&removeError];
-        [ISHDiagnosticsStore recordBreadcrumb:@"session.resumed.imageConsumed"
-                                      details:@{@"removed": @(removed),
-                                                @"error": removeError.localizedDescription ?: @""}];
-    }
+    self.pendingResumeImageToDelete = nil;
+    ISHSessionConsumeResumedImage(consume);
 
     // What the boot block in viewDidLoad is followed by: the terminal cannot be
     // attached to the view until there IS a guest.
@@ -1799,7 +1695,7 @@ static const NSTimeInterval kSaveProgressDelay = 0.4;
         [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.ignored"
                                       details:@{@"reason": @"already-running",
                                                 @"pid": @(self.sessionPid)}];
-        self.terminal = [self preferredTerminalForFreshSession];
+        self.terminal = [self preferredTerminalForCurrentSession];
         return;
     }
 
@@ -1824,7 +1720,7 @@ static const NSTimeInterval kSaveProgressDelay = 0.4;
         [self showMessage:message subtitle:subtitle];
         return;
     }
-    self.terminal = [self preferredTerminalForFreshSession];
+    self.terminal = [self preferredTerminalForCurrentSession];
 }
 
 - (void)disposeSessionForWorkspaceClose {
@@ -1920,6 +1816,7 @@ static const NSTimeInterval kSaveProgressDelay = 0.4;
 	    // other an ordinary login. desiredRestoredSessionPid is set by the
 	    // workspace host from the pid it recorded in the saved layout; 0 (the
 	    // full-screen terminal) means "any", which is the old behaviour.
+	    self.sessionWasRestored = NO;
 	    struct checkpoint_restored_session restored;
 	    if (checkpoint_take_restored_session_for_pid(self.desiredRestoredSessionPid, &restored)) {
 	        Terminal *terminal = (__bridge Terminal *) restored.terminal;
@@ -1927,6 +1824,7 @@ static const NSTimeInterval kSaveProgressDelay = 0.4;
 	            self.sessionTerminal = terminal;
 	            self.sessionPid = restored.leader_pid;
 	            self.sessionStartedAt = CFAbsoluteTimeGetCurrent();
+	            self.sessionWasRestored = YES;
 	            [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.resumed"
 	                                          details:@{@"pid": @(restored.leader_pid),
 	                                                    @"pts": @(restored.tty_num)}];

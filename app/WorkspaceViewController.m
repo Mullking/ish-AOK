@@ -40,6 +40,7 @@
 @property (nonatomic) BOOL didOpenInitialTool;
 @property (nonatomic, strong) UIButton *modernMenuPip;
 @property (nonatomic) BOOL didEnsureDefaultWorkspaceUtilities;
+@property (nonatomic) BOOL didAskSessionResumeChoice;
 @property (nonatomic, strong) UIView *desktopSurfaceView;
 @property (nonatomic, strong) UIImageView *desktopWallpaperView;
 @property (nonatomic, copy) NSString *appliedWallpaperThemeIdentifier;
@@ -5453,6 +5454,67 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     ISHWorkspaceActiveController = self;
     [self applyCurrentThemeWallpaperIfNeededForced:NO];
     [self applyCompactSizingToOpenWorkspaceToolWindows];
+    // Which saved session, before a single window opens.
+    //
+    // Everything below latches. -didEnsureDefaultWorkspaceUtilities fires once
+    // and reads checkpoint_get_status to decide between restoring the saved
+    // arrangement and opening the default utilities -- so running it before the
+    // question is answered and the guest rebuilt misses the resume branch and
+    // never retries it. The comment down there predicted exactly this case
+    // ("the session picker still up, say"); this is what stops it happening.
+    if ([self presentSessionResumeChoiceIfNeeded])
+        return;
+    [self performWorkspaceLaunchWork];
+}
+
+// The question, and the boot that was waiting on it.
+//
+// YES means "asked, and this pass is over": the launch work runs again from the
+// completion, with the answer in hand.
+- (BOOL)presentSessionResumeChoiceIfNeeded {
+    if (!ISHSessionResumeChoicePending())
+        return NO;
+    // Asked, and still unanswered -- which is a state this can genuinely be
+    // re-entered in: backgrounding the app with the sheet up and coming back
+    // runs viewDidAppear again. Answering "no, carry on" there would run the
+    // launch work with the boot still held, so every terminal it opened would
+    // fail and the layout latch would fire on the wrong branch.
+    if (self.didAskSessionResumeChoice)
+        return YES;
+    // Something else is on screen (a tool's own alert). Presenting into that
+    // loses the sheet, so come back for it -- the launch work must not run
+    // ahead of the answer either way.
+    if (self.presentedViewController != nil) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) (250 * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (strongSelf != nil && ![strongSelf presentSessionResumeChoiceIfNeeded])
+                [strongSelf performWorkspaceLaunchWork];
+        });
+        return YES;
+    }
+    self.didAskSessionResumeChoice = YES;
+    __weak typeof(self) weakSelf = self;
+    ISHSessionPresentResumePicker(self, ^(NSString *imageToConsume) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf == nil)
+            return;
+        // The boot ISHSessionHoldBootUntilResumeChoice was holding. A resume
+        // rebuilds the guest from the image inside this call, so
+        // checkpoint_get_status only describes THIS launch once it returns --
+        // which is why the layout work comes after it and not before.
+        intptr_t bootError = [AppDelegate ensureBooted];
+        [ISHDiagnosticsStore recordBreadcrumb:@"workspace.sessionChoice.answered"
+                                      details:@{@"bootError": @(bootError),
+                                                @"consumed": @(imageToConsume.length > 0)}];
+        ISHSessionConsumeResumedImage(imageToConsume);
+        [strongSelf performWorkspaceLaunchWork];
+    });
+    return YES;
+}
+
+- (void)performWorkspaceLaunchWork {
     if (!self.didOpenInitialTool && self.initialToolIdentifier.length > 0) {
         self.didOpenInitialTool = YES;
         [self openWorkspaceToolWithIdentifier:self.initialToolIdentifier];
@@ -12202,7 +12264,9 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         [_contentStack addArrangedSubview:_newWorkspaceButton];
         _closeHiddenButton = [self workspacesActionButtonWithTitle:@"Close Hidden Windows" action:@selector(confirmCloseHiddenWindows:)];
         [_contentStack addArrangedSubview:_closeHiddenButton];
-        _sessionButton = [self workspacesActionButtonWithTitle:@"Session\u2026" action:@selector(sessionActionsFromApplet:)];
+        _sessionButton = [self workspacesIconButtonWithSymbol:@"arrow.down.doc"
+                                                     fallback:@"Session"
+                                                       action:@selector(sessionActionsFromApplet:)];
         [_contentStack addArrangedSubview:_sessionButton];
     } else {
         // Modern folds the Layout Manager into this applet as two icons.
@@ -12213,12 +12277,16 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         [layoutRow addArrangedSubview:[self workspacesIconButtonWithSymbol:@"square.and.arrow.down" fallback:@"Save" action:@selector(saveLayoutFromApplet:)]];
         [layoutRow addArrangedSubview:[self workspacesIconButtonWithSymbol:@"arrow.clockwise" fallback:@"Restore" action:@selector(restoreLayoutFromApplet:)]];
         [_contentStack addArrangedSubview:layoutRow];
-        // A TITLED button, not a third icon in the row above: that row is the
-        // Layout Manager, where "Save" means the window layout. A session save
-        // sitting beside it as another icon would read as the same kind of
-        // thing, and the two are not remotely the same -- one remembers where
-        // your windows are, the other writes the running machine to disk.
-        _sessionButton = [self workspacesActionButtonWithTitle:@"Session\u2026" action:@selector(sessionActionsFromApplet:)];
+        // The SAME symbol the shell-mode terminal uses for its session control
+        // (arrow.down.doc, TerminalViewController's save button), on its own row
+        // rather than in the Layout Manager row above -- that row's "Save" means
+        // the window arrangement, and the two are not remotely the same thing.
+        // I first made this a titled button to keep them apart; the icon is what
+        // was asked for, and matching the shell is a better way to say "session"
+        // than a word that has to compete with "Save" three pixels away.
+        _sessionButton = [self workspacesIconButtonWithSymbol:@"arrow.down.doc"
+                                                     fallback:@"Session"
+                                                       action:@selector(sessionActionsFromApplet:)];
         [_contentStack addArrangedSubview:_sessionButton];
     }
     CGFloat listInset = ISHWorkspaceUsesPhoneLayout() ? 6.0 : 8.0;

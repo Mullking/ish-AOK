@@ -92,3 +92,18 @@ void ISHSessionSetCurrentSlot(NSString *_Nullable path);
 void ISHSessionSetResumeChoice(NSString *_Nullable path);
 // YES while nothing has been chosen and there is something to choose between.
 BOOL ISHSessionResumeChoicePending(void);
+
+// Ask which saved session to resume -- or none -- from whichever root happens to
+// be on screen, and report the answer on the main queue. The argument is the
+// image to delete once a session is actually running, or nil to keep it.
+void ISHSessionPresentResumePicker(UIViewController *_Nonnull host,
+                                   void (^_Nonnull completion)(NSString *_Nullable imageToConsume));
+// Delete an image the user asked to be rid of. Called once there is a running
+// session to show for it, never at the moment of choosing: consuming it first
+// destroys the only copy whenever the restore then fails.
+void ISHSessionConsumeResumedImage(NSString *_Nullable path);
+// Refuse +ensureBooted while the question above is unanswered. Armed by whoever
+// is going to ask, and lifts itself the moment an answer is recorded.
+// ensureBooted is dispatch_once, so a boot that slips in first is permanent --
+// the answer given afterwards then has nothing left to decide.
+void ISHSessionHoldBootUntilResumeChoice(void);

@@ -360,6 +360,19 @@ static void ConfigureTerminalViewController(SceneDelegate *delegate, TerminalVie
         return;
     }
 
+    // Every root below is one a person is looking at, so every one of them can
+    // be asked which session to resume -- and until one of them is, nothing may
+    // boot. ensureBooted is dispatch_once: an applet or the Wayland display
+    // reaching the guest first would settle the launch as a fresh boot while
+    // the question was still on screen, which is exactly the blank restore that
+    // was reported from Workspace-at-start mode.
+    //
+    // Above this point are the roots that never boot anything (diagnostics,
+    // recovery, the root pickers), and a launch with no scene at all -- a
+    // Shortcut, say -- never reaches here and keeps the old behaviour of
+    // resuming the newest slot unasked.
+    ISHSessionHoldBootUntilResumeChoice();
+
     NSString *activityType = requestedActivity.activityType;
     BOOL wantsWorkspace = [activityType isEqualToString:ISHSceneActivityTypeWorkspace];
     BOOL wantsTerminal = activityType.length == 0

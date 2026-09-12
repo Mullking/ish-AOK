@@ -92,6 +92,11 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
     Terminal *_Nullable _sessionTerminal;
     int _sessionPid; // the currently active session's pid, 0 if none
 
+    // The image the user asked to be rid of, held until there is a running
+    // session to show for it (see ISHSessionConsumeResumedImage).
+    NSString *_Nullable _pendingResumeImageToConsume;
+    BOOL _didAskSessionResumeChoice; // the sheet is up; don't stack a second one
+
     // A prior session we've asked to tear down but haven't yet confirmed is
     // actually gone. -teardownSession only *initiates* teardown (hangs up
     // the pty) -- the guest side (start-wayland.sh's trap killing labwc/
@@ -476,6 +481,29 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
 - (void)startGuestSession {
     if (_state != DisplayConnectionStateIdle && _state != DisplayConnectionStateFailed)
         return;
+    // Which saved session, before ensureBooted decides it for us.
+    //
+    // A standalone Wayland display is a launch root like any other, and it is
+    // the one that reaches the guest earliest -- so with nobody asking, it was
+    // this call that settled the launch as a fresh boot while a suspended
+    // session sat on disk. Deliberately ahead of the _state change below, so the
+    // re-entry from the completion is not turned away by the guard above.
+    if (ISHSessionResumeChoicePending()) {
+        // Reconnect can land here again while the sheet is still up.
+        if (_didAskSessionResumeChoice)
+            return;
+        _didAskSessionResumeChoice = YES;
+        _statusLabel.text = @"Waiting for a session choice…";
+        __weak typeof(self) weakSelf = self;
+        ISHSessionPresentResumePicker(self, ^(NSString *imageToConsume) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (strongSelf == nil)
+                return;
+            strongSelf->_pendingResumeImageToConsume = imageToConsume;
+            [strongSelf startGuestSession];
+        });
+        return;
+    }
     _reconnectButton.hidden = YES;
     _state = DisplayConnectionStateStartingGuestSession;
     _statusLabel.text = @"Starting Wayland session…";
@@ -486,6 +514,11 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
         [self failWithMessage:[NSString stringWithFormat:@"Boot failed: %@", [AppDelegate descriptionForISHErrno:err]]];
         return;
     }
+    // Only now: the restore runs inside ensureBooted, and deleting the image
+    // before it has worked would throw away the only copy.
+    NSString *consume = _pendingResumeImageToConsume;
+    _pendingResumeImageToConsume = nil;
+    ISHSessionConsumeResumedImage(consume);
 
     err = become_new_init_child();
     if (err < 0) {

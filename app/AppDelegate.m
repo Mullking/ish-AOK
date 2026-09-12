@@ -2587,6 +2587,184 @@ BOOL ISHSessionResumeChoicePending(void) {
     return ISHSessionSlots().count > 0;
 }
 
+// ---- the resume question -------------------------------------------------
+//
+// Asked from wherever the app happened to start, which is why it lives beside
+// the slot bookkeeping rather than inside a view controller.
+//
+// It used to belong to TerminalViewController -- the one root that needs it
+// least. Workspace-at-start and the standalone Wayland display open no terminal
+// at launch, so nobody asked, and whatever reached the guest first booted a
+// fresh one underneath them. Reported as the dialog "not showing up on restart.
+// In workspace at start mode anyway", and the thread dump settled it: init-1,
+// login-3, bash-14, and no "resumed a suspended session" line. A fresh boot --
+// so the answer given afterwards had nothing left to decide.
+
+// Nothing may boot while the question is open.
+//
+// Armed rather than implied, because "a choice is pending" is not the same as
+// "somebody is going to be asked": a Shortcut or other background entry point
+// boots with nobody looking at a dialog, and must still resume the newest slot
+// the way a single suspend.img always did. Whoever puts the question on screen
+// arms this; ISHSessionSetResumeChoice lifts it by answering.
+static BOOL ishSessionBootHeldForChoice = NO;
+
+void ISHSessionHoldBootUntilResumeChoice(void) {
+    if (ISHSessionResumeChoicePending())
+        ishSessionBootHeldForChoice = YES;
+}
+
+void ISHSessionConsumeResumedImage(NSString *path) {
+    if (path.length == 0)
+        return;
+    NSError *removeError = nil;
+    BOOL removed = [NSFileManager.defaultManager removeItemAtPath:path error:&removeError];
+    [ISHDiagnosticsStore recordBreadcrumb:@"session.resumed.imageConsumed"
+                                  details:@{@"removed": @(removed),
+                                            @"error": removeError.localizedDescription ?: @""}];
+}
+
+// Keep the saved copy, or consume it?
+//
+// A resumed image is not automatically finished with: iSH-AOK goes on writing
+// to the slot it came from, so the copy on disk stays resumable. That is the
+// safe default and it is what people want after a crash -- but it also means
+// the same session can be resumed twice, which gives two live copies of one
+// machine, and an image nobody intends to use again just sits there.
+//
+// So the choice is offered rather than assumed, and "delete" means AFTER the
+// restore has worked: consuming it first would destroy the only copy if the
+// restore then failed.
+static void ISHSessionPresentResumeDisposition(UIViewController *host,
+                                               NSDictionary *slot,
+                                               void (^completion)(NSString *_Nullable)) {
+    NSString *path = slot[@"path"];
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"Resume this session"
+                         message:@"Keep the saved copy so it can be resumed again, "
+                                 @"or remove it once this session is running?"
+                  preferredStyle:UIAlertControllerStyleAlert];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Resume and Save"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *a) {
+        ISHSessionSetResumeChoice(path);
+        // Un-pin the slot, or "Save" lasts about a minute.
+        //
+        // ISHSessionSetResumeChoice pins the current slot to the image that was
+        // resumed, on the reasoning that a resumed session keeps writing where
+        // it came from. That is right for a session being suspended over and
+        // over, and exactly wrong here: the next Suspend and Exit would write
+        // straight over the copy the user just asked to keep. Reported as
+        // "I said save and the previous suspend was gone".
+        //
+        // Unpinned, the next save takes a fresh slot and the kept copy stays
+        // resumable. Slots are finite (ISHSessionSlotLimit), so repeating this
+        // eventually recycles the oldest -- which is the honest meaning of
+        // "keep" on a device with a disk.
+        ISHSessionSetCurrentSlot(nil);
+        completion(nil);
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Resume and Delete"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(__unused UIAlertAction *a) {
+        ISHSessionSetResumeChoice(path);
+        // The slot STAYS pinned here: the image is about to be deleted, so
+        // letting this session write back over that name reuses the freed slot
+        // instead of consuming another one.
+        // Handed back, not done: the file is removed once there is a running
+        // session to show for it.
+        completion(path);
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Back"
+                                              style:UIAlertActionStyleCancel
+                                            handler:^(__unused UIAlertAction *a) {
+        // Nothing has been decided yet, so the picker can simply come back.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ISHSessionPresentResumePicker(host, completion);
+        });
+    }]];
+
+    [host presentViewController:sheet animated:YES completion:nil];
+}
+
+// Resume which session, or none.
+//
+// Presented BEFORE the guest boots, because the answer decides whether it boots
+// at all or is rebuilt from an image -- there is no undoing that once
+// ensureBooted has run.
+void ISHSessionPresentResumePicker(UIViewController *host,
+                                   void (^completion)(NSString *_Nullable)) {
+    NSArray<NSDictionary *> *slots = ISHSessionSlots();
+    // Asked for by something that has nothing to offer: answer it rather than
+    // showing an empty sheet, so the caller's completion still runs and the
+    // boot hold still lifts.
+    if (slots.count == 0) {
+        ISHSessionSetResumeChoice(nil);
+        completion(nil);
+        return;
+    }
+    [ISHDiagnosticsStore recordBreadcrumb:@"session.resumePicker.presented"
+                                  details:@{@"slots": @(slots.count),
+                                            @"host": NSStringFromClass(host.class)}];
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"Resume a session?"
+                         message:slots.count == 1
+                                 ? @"iSH-AOK saved this session. Pick it up, or start fresh."
+                                 : @"iSH-AOK has saved sessions. Pick one up, or start fresh."
+                  preferredStyle:UIAlertControllerStyleAlert];
+
+    NSDateFormatter *when = [[NSDateFormatter alloc] init];
+    when.dateStyle = NSDateFormatterShortStyle;
+    when.timeStyle = NSDateFormatterShortStyle;
+
+    for (NSDictionary *slot in slots) {
+        // An image this build cannot load is offered as nothing but a deletion:
+        // choosing it would boot instead, which looks like the resume silently
+        // failing.
+        BOOL loadable = [slot[@"loadable"] boolValue];
+        NSString *title;
+        if (loadable) {
+            title = [NSString stringWithFormat:@"%@ — %@ process%@, %@",
+                     slot[@"hostname"], slot[@"tasks"],
+                     [slot[@"tasks"] unsignedLongValue] == 1 ? @"" : @"es",
+                     [when stringFromDate:slot[@"date"]]];
+        } else {
+            title = [NSString stringWithFormat:@"%@ (saved by a different build)",
+                     [when stringFromDate:slot[@"date"]]];
+        }
+        [sheet addAction:[UIAlertAction actionWithTitle:title
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *a) {
+            if (!loadable) {
+                ISHSessionSetResumeChoice(nil);
+                [NSFileManager.defaultManager removeItemAtPath:slot[@"path"] error:nil];
+                completion(nil);
+                return;
+            }
+            // Next runloop turn: this sheet is still dismissing, and presenting
+            // the second one from inside its own handler races that.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ISHSessionPresentResumeDisposition(host, slot, completion);
+            });
+        }]];
+    }
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Start a New Session"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *a) {
+        // The images are KEPT. "New session" is about this launch, not about
+        // throwing away what is on disk -- deleting somebody's saved work
+        // because they wanted a fresh prompt is not a thing to do quietly.
+        ISHSessionSetResumeChoice(nil);
+        completion(nil);
+    }]];
+
+    [host presentViewController:sheet animated:YES completion:nil];
+}
+
 int ISHSuspendSessionSaveNow(void) {
     NSString *image = ISHSuspendSessionImagePath();
     if (image == nil)
@@ -2631,6 +2809,20 @@ static TerminalViewController *CreateTerminalViewController(void) {
 }
 
 + (intptr_t)ensureBooted {
+    // Held, if somebody is about to ask which session to resume.
+    //
+    // Everything below happens exactly once, so the first caller through here
+    // settles whether this launch boots fresh or is rebuilt from an image. In
+    // Workspace mode that first caller was never the picker: an applet reaching
+    // the guest, or the Wayland display connecting, got here while the question
+    // was still on screen -- and the restore could no longer run.
+    if (ishSessionBootHeldForChoice) {
+        if (ISHSessionResumeChoicePending()) {
+            [ISHDiagnosticsStore recordBreadcrumb:@"boot.held.sessionChoice"];
+            return _EAGAIN;
+        }
+        ishSessionBootHeldForChoice = NO;
+    }
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         [ISHDiagnosticsStore recordLaunchStage:@"boot.ensure.begin"];
@@ -3229,7 +3421,24 @@ static TerminalViewController *CreateTerminalViewController(void) {
         checkpoint_set_session(sessionImage.fileSystemRepresentation);
         if ([NSFileManager.defaultManager fileExistsAtPath:sessionImage]) {
             int rerr = checkpoint_restore(sessionImage.fileSystemRepresentation);
-            [NSFileManager.defaultManager removeItemAtPath:sessionImage error:nil];
+            // Consumed here only when nobody chose to keep it.
+            //
+            // Restoring used to delete the image unconditionally, on the
+            // reasoning that an image resumed twice gives two live copies of one
+            // machine. That predates the picker, and it quietly defeated it:
+            // "Resume and Save" kept nothing, because the boot had already
+            // removed the file by the time the answer was acted on. Reported as
+            // "tried resume and save ... and upon restart the previous suspend
+            // was gone".
+            //
+            // So: a launch nobody was asked (a Shortcut, a background entry
+            // point) still consumes it, and a restore that FAILED still drops
+            // the image rather than re-offering something that cannot be loaded.
+            // Otherwise the disposition owns it -- "Resume and Delete" removes it
+            // through ISHSessionConsumeResumedImage once there is a running
+            // session to show for it.
+            if (!ishSessionResumeDecided || rerr < 0)
+                [NSFileManager.defaultManager removeItemAtPath:sessionImage error:nil];
             if (rerr >= 0) {
                 // The machine services a resume needs as much as a boot does.
                 // Neither is part of the boot COMMAND -- they are the pager and

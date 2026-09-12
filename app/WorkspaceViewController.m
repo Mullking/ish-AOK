@@ -177,6 +177,13 @@ static NSString *const ISHWorkspaceSavedLayoutKindDashboard = @"dashboard";
 static NSString *const ISHWorkspaceSavedLayoutKindDock = @"dock";
 static NSString *const ISHWorkspaceSavedLayoutKindTool = @"tool";
 static NSString *const ISHWorkspaceSavedLayoutKindTerminal = @"terminal";
+// The Desktops themselves -- how many there were and which was showing.
+//
+// Window descriptors carry a desktopIndex, and assignRestoredWindow: grows the
+// count to fit one, so a Desktop with something on it came back by accident of
+// its contents. An EMPTY Desktop had nothing to grow it and was simply lost,
+// and the Desktop you were looking at was never restored at all.
+static NSString *const ISHWorkspaceSavedLayoutKindDesktops = @"desktops";
 static NSString *const ISHWorkspaceTerminalRoleSessionShell = @"session-shell";
 static NSString *const ISHWorkspaceTerminalRoleSystemConsole = @"system-console";
 static NSString *const ISHWorkspaceTerminalRoleGeneric = @"terminal";
@@ -3798,6 +3805,11 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 
 - (void)saveWorkspaceLayout:(id)sender {
     NSMutableArray<NSDictionary<NSString *, id> *> *layout = [NSMutableArray array];
+    // First, so the restore can size the Desktops before placing anything on
+    // them.
+    [layout addObject:@{@"kind": ISHWorkspaceSavedLayoutKindDesktops,
+                        @"count": @(self.desktopCount),
+                        @"active": @(self.activeDesktopIndex)}];
     for (UIView *subview in self.desktopSurfaceView.subviews) {
         if (![subview isKindOfClass:ISHWorkspaceContainedWindowView.class])
             continue;
@@ -3842,12 +3854,15 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 // asked, and an alert at launch would be an error message for something that
 // merely has nothing to put back.
 - (void)applySavedWorkspaceLayout:(NSArray<NSDictionary<NSString *, id> *> *)layout {
+    NSDictionary<NSString *, id> *desktopsDescriptor = nil;
     NSDictionary<NSString *, id> *dashboardDescriptor = nil;
     NSDictionary<NSString *, id> *dockDescriptor = nil;
     NSMutableArray<NSDictionary<NSString *, id> *> *windowDescriptors = [NSMutableArray array];
     for (NSDictionary<NSString *, id> *descriptor in layout) {
         NSString *kind = descriptor[@"kind"];
-        if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDashboard]) {
+        if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDesktops]) {
+            desktopsDescriptor = descriptor;
+        } else if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDashboard]) {
             dashboardDescriptor = descriptor;
         } else if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDock]) {
             dockDescriptor = descriptor;
@@ -3857,6 +3872,11 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     }
 
     [self closeAllRestorableDesktopWindows];
+    // Before any window is placed: a Desktop that held nothing has no window to
+    // grow the count for it, so without this an empty Desktop disappears.
+    NSInteger savedDesktopCount = [desktopsDescriptor[@"count"] integerValue];
+    if (savedDesktopCount > self.desktopCount)
+        self.desktopCount = savedDesktopCount;
     if (dashboardDescriptor != nil)
         [self applySavedDashboardDescriptor:dashboardDescriptor];
     if (dockDescriptor != nil)
@@ -3923,6 +3943,14 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
                     windowView.hostedTerminalViewController.overrideFontSize = savedFontSize;
             }
         }
+    }
+
+    // The Desktop that was showing -- after the windows, because switching
+    // decides which of them are visible.
+    if (desktopsDescriptor != nil) {
+        NSInteger active = [desktopsDescriptor[@"active"] integerValue];
+        if (active >= 0 && active < self.desktopCount)
+            [self switchToDesktopIndex:active];
     }
 
     [self applyDesktopVisibility];

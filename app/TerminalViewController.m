@@ -445,6 +445,20 @@ static const NSInteger kMaximumTerminalFontSize = 72;
                                             handler:^(__unused UIAlertAction *a) {
         ISHSessionSetResumeChoice(path);
         self.pendingResumeImageToDelete = nil;
+        // Un-pin the slot, or "Save" lasts about a minute.
+        //
+        // ISHSessionSetResumeChoice pins the current slot to the image that was
+        // resumed, on the reasoning that a resumed session keeps writing where
+        // it came from. That is right for a session being suspended over and
+        // over, and exactly wrong here: the next Suspend and Exit would write
+        // straight over the copy the user just asked to keep. Reported as
+        // "I said save and the previous suspend was gone".
+        //
+        // Unpinned, the next save takes a fresh slot and the kept copy stays
+        // resumable. Slots are finite (ISHSessionSlotLimit), so repeating this
+        // eventually recycles the oldest -- which is the honest meaning of
+        // "keep" on a device with a disk.
+        ISHSessionSetCurrentSlot(nil);
         [self _bootAfterSessionChoice];
     }]];
 
@@ -452,6 +466,9 @@ static const NSInteger kMaximumTerminalFontSize = 72;
                                               style:UIAlertActionStyleDestructive
                                             handler:^(__unused UIAlertAction *a) {
         ISHSessionSetResumeChoice(path);
+        // The slot STAYS pinned here: the image is about to be deleted, so
+        // letting this session write back over that name reuses the freed slot
+        // instead of consuming another one.
         // Remembered, not done: the file is removed once there is a running
         // session to show for it.
         self.pendingResumeImageToDelete = path;
